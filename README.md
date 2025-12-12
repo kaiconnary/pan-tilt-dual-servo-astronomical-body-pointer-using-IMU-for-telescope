@@ -1,0 +1,2 @@
+# pan-tilt-dual-servo-astronomical-body-pointer-using-IMU-for-telescope
+This program uses a pan (azimuth) and tilt (elevation) mount with a IMU (BNO055) mounted on top. Using this setup, we can use the skyfield API to grab azimuth and elevation of astronomical bodies relative to coordinates (and to timezones). Once desired body is being pointed at by mount, capture orientation on IMU and transfer to telescope for ease 
