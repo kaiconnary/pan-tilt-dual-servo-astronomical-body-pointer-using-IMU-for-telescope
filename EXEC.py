@@ -1,228 +1,410 @@
-#!/usr/bin/env python3
-import time
-import board
-import busio
-import adafruit_bno055
-from adafruit_servokit import ServoKit
-from skyfield.api import load, wgs84, Star
+from skyfield.api import load, wgs84
 from skyfield import almanac
 from datetime import datetime, timezone
-import math
+import time
+import serial
+import serial.tools.list_ports
+import json
+import re
 
-class StarTracker:
-    def __init__(self, latitude, longitude, elevation=0):
-        print("Initializing BNO055...")
-        i2c = busio.I2C(board.SCL, board.SDA)
-        self.sensor = adafruit_bno055.BNO055_I2C(i2c)
+class AstroTracker:
+    def __init__(self, latitude, longitude, elevation=0, port=None, baudrate=9600):
+        """
+        Initialize the astronomical tracker with IMU feedback
         
-        # Initialize servo controller (PCA9685)
-        print("Initializing servos...")
-        self.kit = ServoKit(channels=16)
-        
-        # Servo configuration
-        self.pan_channel = 0  # Pan servo on channel 0
-        self.tilt_channel = 1  # Tilt servo on channel 1
-        
-        # Servo angle ranges
-        self.pan_min = 0
-        self.pan_max = 180
-        self.tilt_min = 0
-        self.tilt_max = 180
-        
-        # Center servos at startup
-        self.center_servos()
-        
-        # Initialize Skyfield
-        print("Loading ephemeris data...")
+        Args:
+            latitude: Observer latitude in degrees
+            longitude: Observer longitude in degrees
+            elevation: Observer elevation in meters
+            port: Serial port (e.g., 'COM3' or '/dev/ttyUSB0')
+            baudrate: Serial communication speed
+        """
+        # Load ephemeris data
+        print("Loading astronomical data...")
         self.ts = load.timescale()
         self.eph = load('de421.bsp')  # Planetary ephemeris
         
         # Set observer location
         self.location = wgs84.latlon(latitude, longitude, elevation)
         
-        # Calibration offset (from BNO055 to servo reference frame)
-        self.azimuth_offset = 0
-        self.altitude_offset = 0
-        
-        print("Star tracker initialized!")
-        
-    def center_servos(self):
-        """Move servos to center position"""
-        self.kit.servo[self.pan_channel].angle = 90
-        self.kit.servo[self.tilt_channel].angle = 90
-        time.sleep(1)
-        
-    def calibrate_orientation(self):
-        """
-        Calibrate the mount orientation using BNO055
-        Point mount at known azimuth (e.g., North) before calling
-        """
-        print("Calibrating... Keep mount pointed North")
-        time.sleep(2)
-        
-        euler = self.sensor.euler
-        if euler[0] is not None:
-            self.azimuth_offset = euler[0]
-            print(f"Azimuth offset set to: {self.azimuth_offset:.2f}°")
+        # Initialize serial connection to Arduino
+        self.serial_conn = None
+        if port:
+            self.connect_arduino(port, baudrate)
         else:
-            print("Warning: Could not read sensor for calibration")
+            self.auto_connect_arduino(baudrate)
+        
+        # Wait for Arduino to initialize IMU
+        time.sleep(3)
+        
+        # Check IMU calibration status
+        self.check_imu_calibration()
+    
+    def list_serial_ports(self):
+        """List all available serial ports"""
+        ports = serial.tools.list_ports.comports()
+        available_ports = []
+        print("\nAvailable serial ports:")
+        for port in ports:
+            print(f"  {port.device} - {port.description}")
+            available_ports.append(port.device)
+        return available_ports
+    
+    def auto_connect_arduino(self, baudrate=9600):
+        """Attempt to automatically connect to Arduino"""
+        ports = serial.tools.list_ports.comports()
+        arduino_keywords = ['Arduino', 'CH340', 'USB-SERIAL', 'ttyUSB', 'ttyACM']
+        
+        for port in ports:
+            for keyword in arduino_keywords:
+                if keyword.lower() in port.description.lower() or keyword in port.device:
+                    try:
+                        print(f"\nAttempting to connect to {port.device}...")
+                        self.connect_arduino(port.device, baudrate)
+                        return
+                    except:
+                        continue
+        
+        print("\nCouldn't auto-detect Arduino. Available ports:")
+        self.list_serial_ports()
+        print("Please specify port manually when creating AstroTracker")
+    
+    def connect_arduino(self, port, baudrate=9600):
+        """Connect to Arduino via serial"""
+        try:
+            self.serial_conn = serial.Serial(port, baudrate, timeout=2)
+            time.sleep(2)  # Wait for Arduino to reset
+            print(f"Connected to Arduino on {port}")
             
-    def get_current_orientation(self):
-        """Get current mount orientation from BNO055"""
-        euler = self.sensor.euler
+            # Read initial messages
+            time.sleep(1)
+            while self.serial_conn.in_waiting:
+                line = self.serial_conn.readline().decode().strip()
+                print(f"Arduino: {line}")
+                
+        except Exception as e:
+            print(f"Error connecting to Arduino: {e}")
+            self.serial_conn = None
+    
+    def send_command(self, command, data=None):
+        """Send command to Arduino and get response"""
+        if not self.serial_conn or not self.serial_conn.is_open:
+            print("Warning: No Arduino connection")
+            return None
         
-        if euler[0] is None:
-            return None, None
+        try:
+            # Format: COMMAND:data1,data2\n
+            if data:
+                cmd_str = f"{command}:{','.join(map(str, data))}\n"
+            else:
+                cmd_str = f"{command}\n"
             
-        # euler[0] = heading (0-360°)
-        # euler[1] = roll
-        # euler[2] = pitch
-        
-        azimuth = (euler[0] - self.azimuth_offset) % 360
-        altitude = euler[2]  # Using pitch as altitude
-        
-        return azimuth, altitude
-        
-    def calculate_object_position(self, target):
+            self.serial_conn.write(cmd_str.encode())
+            time.sleep(0.1)  # Give Arduino time to process
+            
+            # Read response(s)
+            responses = []
+            timeout = time.time() + 1  # 1 second timeout
+            while time.time() < timeout:
+                if self.serial_conn.in_waiting:
+                    response = self.serial_conn.readline().decode().strip()
+                    if response:
+                        responses.append(response)
+                time.sleep(0.05)
+            
+            return responses if responses else None
+            
+        except Exception as e:
+            print(f"Serial communication error: {e}")
+        return None
+    
+    def check_imu_calibration(self):
+        """Check BNO055 calibration status"""
+        print("\nChecking IMU calibration status...")
+        response = self.send_command('STATUS')
+        if response:
+            for line in response:
+                if 'Calibration' in line or 'System' in line or 'Gyro' in line:
+                    print(f"  {line}")
+    
+    def calibrate_imu(self):
+        """Calibrate the IMU at current position"""
+        print("\nCalibrating IMU...")
+        print("Ensure mount is in a known orientation (e.g., pointing North at 45° elevation)")
+        response = self.send_command('CALIBRATE')
+        if response:
+            for line in response:
+                print(f"  {line}")
+    
+    def get_imu_orientation(self):
+        """Get current orientation from IMU"""
+        response = self.send_command('GET_ORIENTATION')
+        if response:
+            for line in response:
+                if 'ORIENTATION:' in line:
+                    # Parse: ORIENTATION: Az=123.45° Alt=45.67° Roll=0.12°
+                    match = re.search(r'Az=([\d.]+)° Alt=([\d.]+)° Roll=([\d.]+)°', line)
+                    if match:
+                        return {
+                            'azimuth': float(match.group(1)),
+                            'altitude': float(match.group(2)),
+                            'roll': float(match.group(3))
+                        }
+        return None
+    
+    def get_body_position(self, body_name, t=None):
         """
-        Calculate azimuth and altitude for a celestial object
+        Calculate alt-azimuth position of astronomical body
         
         Args:
-            target: Skyfield object (planet, star, etc.)
-            
-        Returns:
-            azimuth, altitude in degrees
-        """
-        t = self.ts.now()
-        observer = self.eph['earth'] + self.location
+            body_name: Name of body ('sun', 'moon', 'mars', etc.)
+            t: Time object (uses current time if None)
         
-        astrometric = observer.at(t).observe(target)
+        Returns:
+            dict with 'altitude' and 'azimuth' in degrees
+        """
+        if t is None:
+            t = self.ts.now()
+        
+        # Get the astronomical body
+        bodies = {
+            'sun': self.eph['sun'],
+            'moon': self.eph['moon'],
+            'mercury': self.eph['mercury'],
+            'venus': self.eph['venus'],
+            'mars': self.eph['mars'],
+            'jupiter': self.eph['jupiter barycenter'],
+            'saturn': self.eph['saturn barycenter'],
+            'uranus': self.eph['uranus barycenter'],
+            'neptune': self.eph['neptune barycenter']
+        }
+        
+        if body_name.lower() not in bodies:
+            raise ValueError(f"Unknown body: {body_name}")
+        
+        body = bodies[body_name.lower()]
+        
+        # Calculate position from observer location
+        observer = self.eph['earth'] + self.location
+        astrometric = observer.at(t).observe(body)
         alt, az, distance = astrometric.apparent().altaz()
         
-        return az.degrees, alt.degrees
-        
-    def move_to_position(self, target_az, target_alt):
-        """
-        Move servos to point at target azimuth and altitude
-        
-        Args:
-            target_az: Target azimuth in degrees (0-360)
-            target_alt: Target altitude in degrees (-90 to 90)
-        """
-        # Convert azimuth (0-360) to servo angle (0-180)
-        # Assuming 180° servo range covers 360° of rotation with gearing
-        # Adjust this mapping based on your mechanical setup
-        pan_angle = (target_az / 360.0) * 180.0
-        
-        # Convert altitude (-90 to 90) to servo angle (0-180)
-        # 0° altitude = 90° servo, 90° altitude = 180° servo, -90° = 0° servo
-        tilt_angle = target_alt + 90
-        
-        # Constrain to servo limits
-        pan_angle = max(self.pan_min, min(self.pan_max, pan_angle))
-        tilt_angle = max(self.tilt_min, min(self.tilt_max, tilt_angle))
-        
-        # Move servos
-        self.kit.servo[self.pan_channel].angle = pan_angle
-        self.kit.servo[self.tilt_channel].angle = tilt_angle
-        
-        print(f"Moved to Az: {target_az:.2f}° (servo: {pan_angle:.1f}°), "
-              f"Alt: {target_alt:.2f}° (servo: {tilt_angle:.1f}°)")
-        
-    def track_object(self, target, duration=60, update_interval=1):
-        """
-        Track a celestial object for a specified duration
-        
-        Args:
-            target: Skyfield object to track
-            duration: Tracking duration in seconds
-            update_interval: Update rate in seconds
-        """
-        print(f"Tracking object for {duration} seconds...")
+        return {
+            'altitude': alt.degrees,
+            'azimuth': az.degrees,
+            'distance': distance.au
+        }
+    
+    def set_target_position(self, azimuth, altitude):
+        """Send target position to Arduino (closed-loop with IMU)"""
+        response = self.send_command('MOVE', [azimuth, altitude])
+        return response
+    
+    def wait_for_position(self, timeout=30, tolerance=1.0):
+        """Wait for mount to reach target position"""
         start_time = time.time()
         
-        while (time.time() - start_time) < duration:
-            # Calculate object position
-            az, alt = self.calculate_object_position(target)
+        while time.time() - start_time < timeout:
+            response = self.send_command('STATUS')
+            if response:
+                for line in response:
+                    if 'STATUS:' in line:
+                        # Parse status to check if we're close to target
+                        match = re.search(r'Target Az=([\d.]+)° Alt=([\d.]+)° \| Current Az=([\d.]+)° Alt=([\d.]+)°', line)
+                        if match:
+                            target_az = float(match.group(1))
+                            target_alt = float(match.group(2))
+                            current_az = float(match.group(3))
+                            current_alt = float(match.group(4))
+                            
+                            az_error = abs(target_az - current_az)
+                            # Handle 0/360 wraparound
+                            if az_error > 180:
+                                az_error = 360 - az_error
+                            
+                            alt_error = abs(target_alt - current_alt)
+                            
+                            print(f"  Position error: Az={az_error:.2f}° Alt={alt_error:.2f}°")
+                            
+                            if az_error < tolerance and alt_error < tolerance:
+                                print("  Target reached!")
+                                return True
             
-            # Move to position
-            if alt > 0:  # Only track if above horizon
-                self.move_to_position(az, alt)
-                
-                # Display current orientation
-                current_az, current_alt = self.get_current_orientation()
-                if current_az is not None:
-                    print(f"Current orientation: Az: {current_az:.2f}°, Alt: {current_alt:.2f}°")
-            else:
-                print(f"Object below horizon (altitude: {alt:.2f}°)")
-                
-            time.sleep(update_interval)
+            time.sleep(0.5)
+        
+        print("  Timeout waiting for position")
+        return False
+    
+    def point_at_body(self, body_name, wait=True):
+        """Point servos at specified astronomical body with IMU feedback"""
+        pos = self.get_body_position(body_name)
+        
+        print(f"\n{'='*60}")
+        print(f"{body_name.upper()} Position:")
+        print(f"  Calculated Altitude: {pos['altitude']:.2f}°")
+        print(f"  Calculated Azimuth: {pos['azimuth']:.2f}°")
+        print(f"  Distance: {pos['distance']:.2f} AU")
+        
+        if pos['altitude'] < 0:
+            print(f"  WARNING: {body_name} is below the horizon!")
+            return False
+        
+        # Get current IMU orientation before moving
+        current_orient = self.get_imu_orientation()
+        if current_orient:
+            print(f"\nCurrent IMU Orientation:")
+            print(f"  Azimuth: {current_orient['azimuth']:.2f}°")
+            print(f"  Altitude: {current_orient['altitude']:.2f}°")
+        
+        # Send target to Arduino
+        print(f"\nSending target to Arduino...")
+        response = self.set_target_position(pos['azimuth'], pos['altitude'])
+        if response:
+            for line in response:
+                print(f"  Arduino: {line}")
+        
+        # Wait for positioning
+        if wait:
+            print("\nWaiting for mount to reach target...")
+            self.wait_for_position(timeout=30, tolerance=0.5)
             
-    def point_at_star(self, star_name, ra_hours, dec_degrees):
+            # Verify final position
+            final_orient = self.get_imu_orientation()
+            if final_orient:
+                print(f"\nFinal IMU Orientation:")
+                print(f"  Azimuth: {final_orient['azimuth']:.2f}°")
+                print(f"  Altitude: {final_orient['altitude']:.2f}°")
+                print(f"  Pointing Error: Az={abs(pos['azimuth']-final_orient['azimuth']):.2f}° Alt={abs(pos['altitude']-final_orient['altitude']):.2f}°")
+        
+        print('='*60)
+        return True
+    
+    def track_body(self, body_name, duration_minutes=60, update_interval=30):
         """
-        Point at a specific star by coordinates
+        Continuously track a body for specified duration
         
         Args:
-            star_name: Name of the star
-            ra_hours: Right ascension in hours
-            dec_degrees: Declination in degrees
+            body_name: Name of body to track
+            duration_minutes: How long to track in minutes
+            update_interval: Seconds between position updates
         """
-        star = Star(ra_hours=(ra_hours,), dec_degrees=(dec_degrees,))
-        az, alt = self.calculate_object_position(star)
+        print(f"\n{'='*60}")
+        print(f"Starting tracking of {body_name.upper()}")
+        print(f"Duration: {duration_minutes} minutes")
+        print(f"Update interval: {update_interval} seconds")
+        print('='*60)
         
-        print(f"Pointing at {star_name}")
-        print(f"RA: {ra_hours}h, Dec: {dec_degrees}°")
-        print(f"Azimuth: {az:.2f}°, Altitude: {alt:.2f}°")
+        start_time = time.time()
+        end_time = start_time + (duration_minutes * 60)
         
-        if alt > 0:
-            self.move_to_position(az, alt)
-        else:
-            print(f"{star_name} is below the horizon")
+        try:
+            while time.time() < end_time:
+                self.point_at_body(body_name, wait=True)
+                
+                remaining = (end_time - time.time()) / 60
+                print(f"\n⏱ Time remaining: {remaining:.1f} minutes\n")
+                
+                time.sleep(update_interval)
+                
+        except KeyboardInterrupt:
+            print("\n\nTracking stopped by user")
+    
+    def find_visible_bodies(self):
+        """List all currently visible astronomical bodies"""
+        t = self.ts.now()
+        visible = []
+        
+        bodies = ['sun', 'moon', 'mercury', 'venus', 'mars', 
+                  'jupiter', 'saturn', 'uranus', 'neptune']
+        
+        print("\n" + "="*60)
+        print("Currently Visible Bodies:")
+        print("="*60)
+        
+        for body in bodies:
+            pos = self.get_body_position(body, t)
+            if pos['altitude'] > 0:
+                visible.append(body)
+                print(f"{body.upper():12s} - Alt: {pos['altitude']:6.2f}°  Az: {pos['azimuth']:6.2f}°")
+        
+        if not visible:
+            print("No bodies currently visible above horizon")
+        
+        print("="*60)
+        return visible
+    
+    def home_position(self):
+        """Move servos to home position"""
+        print("\nMoving to home position...")
+        response = self.send_command('HOME')
+        if response:
+            for line in response:
+                print(f"  Arduino: {line}")
+        time.sleep(2)
+    
+    def close(self):
+        """Close serial connection"""
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+            print("Serial connection closed")
 
 
 def main():
-    # Set your location (Atlanta, Georgia as example)
-    LATITUDE = 33.7490  # degrees North
-    LONGITUDE = -84.3880  # degrees West
-    ELEVATION = 320  # meters
+    """Example usage"""
     
-    # Initialize tracker
-    tracker = StarTracker(LATITUDE, LONGITUDE, ELEVATION)
+    # Set your location (example: San Francisco)
+    latitude = 37.7749    # degrees North
+    longitude = -122.4194  # degrees West
+    elevation = 52         # meters
     
-    # Optional: Calibrate by pointing North
-    # tracker.calibrate_orientation()
+    # Initialize tracker (will auto-detect Arduino)
+    # Or specify port: tracker = AstroTracker(lat, lon, elev, port='/dev/ttyUSB0')
+    print("="*60)
+    print("ASTRONOMICAL TRACKER WITH BNO055 IMU")
+    print("="*60)
     
-    # Example 1: Track a planet (Mars)
-    print("\n=== Tracking Mars ===")
-    mars = tracker.eph['mars']
-    tracker.track_object(mars, duration=30, update_interval=2)
+    tracker = AstroTracker(latitude, longitude, elevation)
     
-    # Example 2: Point at a bright star (Sirius)
-    print("\n=== Pointing at Sirius ===")
-    tracker.point_at_star("Sirius", ra_hours=6.75, dec_degrees=-16.72)
-    time.sleep(5)
+    if not tracker.serial_conn:
+        print("ERROR: Could not connect to Arduino")
+        return
     
-    # Example 3: Point at Polaris (North Star)
-    print("\n=== Pointing at Polaris ===")
-    tracker.point_at_star("Polaris", ra_hours=2.53, dec_degrees=89.26)
-    time.sleep(5)
-    
-    # Example 4: Track the Moon
-    print("\n=== Tracking Moon ===")
-    moon = tracker.eph['moon']
-    tracker.track_object(moon, duration=30, update_interval=2)
-    
-    # Return to center
-    print("\n=== Returning to center ===")
-    tracker.center_servos()
+    try:
+        # Calibrate IMU (optional - do this if mount orientation is known)
+        # tracker.calibrate_imu()
+        
+        # Move to home position
+        tracker.home_position()
+        
+        # Show visible bodies
+        tracker.find_visible_bodies()
+        
+        # Get current IMU orientation
+        print("\nCurrent IMU reading:")
+        orient = tracker.get_imu_orientation()
+        if orient:
+            print(f"  Azimuth: {orient['azimuth']:.2f}°")
+            print(f"  Altitude: {orient['altitude']:.2f}°")
+            print(f"  Roll: {orient['roll']:.2f}°")
+        
+        # Point at the moon with precise IMU feedback
+        tracker.point_at_body('moon', wait=True)
+        
+        time.sleep(3)
+        
+        # Point at the sun
+        tracker.point_at_body('sun', wait=True)
+        
+        # Uncomment to track continuously (updates every 30 seconds)
+        # tracker.track_body('moon', duration_minutes=10, update_interval=30)
+        
+    except KeyboardInterrupt:
+        print("\n\nProgram stopped by user")
+    except Exception as e:
+        print(f"\nError: {e}")
+    finally:
+        tracker.close()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nTracking stopped by user")
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+    main()
